@@ -1,0 +1,153 @@
+#inherit httpd
+
+# PHP's Version
+PHP_VERSION=$(php-config --version)
+[ "$PHP_VERSION" == "" ] && PHP_VERSION=7.3.0
+PHP_V=${PHP_VERSION%.*}
+PHP_V=${PHP_V//.}
+
+# PHP's Prefix
+prefix=$(php-config --prefix)
+[ "$prefix" == "" ] && prefix=/usr
+
+# PHP's ConfScanDir
+if [ $(php-config --configure-options | grep -- "--with-config-file-scan-dir" >/dev/null 2>&1)$? -eq 0 ]; then
+	confscandir=$(php-config --configure-options | sed -- 's/^.*--with-config-file-scan-dir=\([^ ]*\).*$/\1/g')
+else
+	confscandir=/etc/php.d
+fi
+
+# PHP's other Paths
+declare path_ids=(sysconfdir libdir datadir bindir sbindir docdir includedir oldincludedir datarootdir mandir)
+declare extra_paths=""
+for i in "${path_ids[@]}"; do
+	if [ $(php-config --$(echo $i | sed 's/dir$/-dir/g') | sed '/^\s*$/d' | wc -l) -eq 1 ]; then
+		declare extra_paths+=" --$i=$(php-config --$(echo $i | sed 's/dir$/-dir/g'))"
+	else
+		if [ $(php-config --configure-options | grep -- "--$i" >/dev/null 2>&1)$? -eq 0 ]; then
+			declare extra_paths+=" $(php-config --configure-options | sed -- "s/^.*\(--$i=[^ ]*\).*$/\1/g")"
+		fi
+	fi
+done
+
+NAME="sqlsrv"
+VERSION=5.6.1
+RELEASE=1
+CATEGORY="PHP"
+SUMMARY="PHP MS-SQL Extension"
+DESCRIPTION=""
+HOMEPAGE="https://pecl.php.net/package/sqlsrv"
+SRC_URI="https://pecl.php.net/get/sqlsrv-${VERSION}.tgz"
+SRC_URI+=" template-ext.reg"
+md5sum=8a2d1dbc571df507356b6164cffa4197
+PATCH_URI="
+	sqlsrv-cygwin.patch
+	sqlsrv561-iodbc.patch
+"
+
+DIFF_EXCLUDES="acinclude.m4 aclocal.m4 autom4te.cache build config.guess config.h.in config.sub configure configure.in CREDITS CYGWIN-PATCHES install-sh ltmain.sh Makefile.global missing mkinstalldirs run-tests.php iodbcunix.h sql.h sqltypes.h"
+KEEP_LA_FILES="none"
+RESTRICT="debuginfo diff postinst-doc postinst-gconf postinst-info upload"
+
+# packaging
+#
+PKG_NAMES="php${PHP_V%%.*}_${NAME}"
+declare php${PHP_V%%.*}_${NAME}_CONTENTS="${confscandir#/}/sqlsrv.ini 
+		${prefix#/}/lib/php/*/sqlsrv.dll
+		${prefix#/}/share/pear/doc/sqlsrv/
+		${prefix#/}/share/pear/.registry/.channel.*/sqlsrv.reg"
+declare php${PHP_V%%.*}_${NAME}_SUMMARY="PHP ${NAME} extension"
+
+src_compile() {
+	cd ${S}	
+	
+	phpize
+	
+	#
+	# autotoolize
+	#
+	rm -f build/libtool.m4
+	libtoolize --copy --force || error "libtoolize failed"
+	cat /usr/share/aclocal/libtool.m4 /usr/share/aclocal/lt{options,sugar,version,~obsolete}.m4 > build/libtool.m4
+	
+	gnuconfigize .
+	
+	# Hack to work around configure adding to hard-coded include_path
+	# only when bundled PEAR is enabled (we package it separately)
+	export PEAR_INSTALLDIR=${prefix}/share/pear
+	
+	mkdir -p ${B}/sqlsrv
+	cd ${B}/sqlsrv
+	
+	CYGCONF_SOURCE="${S}" cygconf \
+		--cache-file=../config.cache \
+		--prefix=${prefix} \
+		--exec-prefix=${prefix} ${extra_paths} \
+		--disable-static \
+		ac_cv_func_ttyname_r_works=yes
+		
+	cygmake -j1 \
+		PHP_GLOBAL_OBJS=''
+}
+
+src_test() {
+	cd ${B}/sqlsrv
+	cygmake -j1 test
+}
+
+src_install() {
+	local x xdir
+
+	cd ${B}/sqlsrv
+	cygmake -j1 install INSTALL_ROOT=${D} INSTALL_IT=
+	
+	mkdir -p ${D}/${confscandir}
+	keepdir ${confscandir}
+	
+	local regdir=${prefix}/share/pear/.registry/.channel.pecl.php.net
+	local xdir=$(php-config --extension-dir)
+	local dll ext docdir path_len summary_len p
+	
+	dodir ${regdir}
+	
+	for x in ${D}${xdir}/*.dll
+	do
+		dll=${x##*/}
+		ext=${dll%.dll}
+		docdir=${prefix}/share/pear/doc/${ext}
+		doc_len=$((${#docdir} + 8))	# /CREDITS
+		path_len=$((${#xdir} + ${#dll} + 1))
+		summary_len=$((${#ext} + 14))	# PHP ___ extension
+
+		# create .ini file for automatic extension loading
+		if $(${OBJDUMP} -p ${x} | grep -q zend_startup_module)
+		then
+			echo "zend_extension = ${xdir}/${dll}" >> ${D}${confscandir}/${ext}.ini
+		else
+			echo "extension = ${dll}" >> ${D}${confscandir}/${ext}.ini
+		fi
+
+		# register extension with pecl to prevent accidental
+		# installation of obsolete versions
+		insinto ${docdir}
+		touch ${S}/CREDITS
+		doins ${S}/CREDITS
+
+		sed -e "s,@DATE@,${date},g;
+			s,@DOCDIR@,${docdir},g;
+			s,@DOC_LEN@,${doc_len},g;
+			s,@DLL@,${dll},g;
+			s,@DLL_LEN@,${#dll},g;
+			s,@EXT@,${ext},g;
+			s,@EXT_LEN@,${#ext},g;
+			s,@PATH@,${xdir}/${dll},g;
+			s,@PATH_LEN@,${path_len},g;
+			s,@SUMMARY_LEN@,${summary_len},g;
+			s,@TIME@,${time},g;
+			s,@VERSION@,${VERSION},g;
+			s,@VERSION_LEN@,${#VERSION},g;
+			s,@TIMESTAMP@,${timestamp}," \
+			${S}/template-ext.reg > ${D}${regdir}/${ext}.reg
+	done
+		
+}

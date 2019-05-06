@@ -1,0 +1,282 @@
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/shared/core_results.cpp	2019-03-19 22:33:46.000000000 +0100
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/shared/core_results.cpp	2019-05-06 11:22:14.069596900 +0200
+@@ -238,7 +238,6 @@
+ 
+ #ifndef _WIN32
+ 
+-
+ std::string getUTF8StringFromString( _In_z_ const SQLWCHAR* source )
+ {
+     // convert to regular character string first
+@@ -1150,7 +1149,14 @@
+     unsigned char* row = get_row();
+     SQLWCHAR* string_data = reinterpret_cast<SQLWCHAR*>( &row[meta[field_index].offset] ) + sizeof( SQLULEN ) / sizeof( SQLWCHAR );
+ 
++	#ifdef HAVE_iODBC
++	// Convert wchar_t* to char*
++	char * converted_string_data = new char[wcslen(string_data)+1];
++	wcstombs(converted_string_data,string_data,wcslen(string_data)+1);
++	return string_to_number<double>( converted_string_data, meta[ field_index ].length, buffer, buffer_length, out_buffer_length, last_error );
++	#else
+     return string_to_number<double>( string_data, meta[field_index].length, buffer, buffer_length, out_buffer_length, last_error );
++	#endif
+ }
+ 
+ SQLRETURN sqlsrv_buffered_result_set::string_to_long( _In_ SQLSMALLINT field_index, _Out_writes_bytes_(*out_buffer_length) void* buffer, _In_ SQLLEN buffer_length,
+@@ -1233,8 +1239,13 @@
+ 			}
+ 
+ #ifndef _WIN32
++             #ifdef HAVE_iODBC
++			 int ch_space = SystemLocale::ToUtf16( CP_ACP, (LPCSTR) field_data, static_cast<int>(to_copy), 
++                                    static_cast<WCHAR*>(buffer), static_cast<int>(to_copy));
++			 #else
+              int ch_space = SystemLocale::ToUtf16( CP_ACP, (LPCSTR) field_data, static_cast<int>(to_copy), 
+                                     static_cast<LPWSTR>(buffer), static_cast<int>(to_copy));
++			 #endif
+ 									
+ #else
+             int ch_space = MultiByteToWideChar( CP_ACP, MB_ERR_INVALID_CHARS, (LPCSTR) field_data, static_cast<int>(to_copy), 
+@@ -1386,8 +1397,13 @@
+         temp_string = reinterpret_cast<SQLCHAR*>( sqlsrv_malloc( field_len, sizeof(char), sizeof(char)));
+ 			
+ #ifndef _WIN32		
++        #ifdef HAVE_iODBC
++		temp_length = SystemLocale::FromUtf16( CP_ACP, (WCHAR*) field_data, static_cast<int>(field_len / sizeof(WCHAR)),
++                                 (LPSTR) temp_string.get(), static_cast<int>(field_len) );
++        #else
+         temp_length = SystemLocale::FromUtf16( CP_ACP, (LPCWSTR) field_data, static_cast<int>(field_len / sizeof(WCHAR)),
+                                  (LPSTR) temp_string.get(), static_cast<int>(field_len) );
++        #endif
+ #else								 			
+         BOOL default_char_used = FALSE;
+         char default_char = '?';
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/shared/core_stmt.cpp	2019-03-19 22:33:46.000000000 +0100
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/shared/core_stmt.cpp	2019-05-06 11:21:41.800442300 +0200
+@@ -1372,8 +1372,13 @@
+ 
+                 // the size of wbuffer is set for the worst case of UTF-8 to UTF-16 conversion, which is a
+                 // expansion of 2x the UTF-8 size.
+-                SQLWCHAR wbuffer[PHP_STREAM_BUFFER_SIZE + 1] = {L'\0'};
++				#ifdef HAVE_iODBC
++                WCHAR wbuffer[ PHP_STREAM_BUFFER_SIZE + 1 ];
++				int wbuffer_size = static_cast<int>( sizeof( wbuffer ) / sizeof( WCHAR ));
++				#else
++				SQLWCHAR wbuffer[PHP_STREAM_BUFFER_SIZE + 1] = {L'\0'};
+                 int wbuffer_size = static_cast<int>( sizeof( wbuffer ) / sizeof( SQLWCHAR ));
++				#endif
+                 DWORD last_error_code = ERROR_SUCCESS;
+                 // buffer_size is the # of wchars.  Since it set to stmt->param_buffer_size / 2, this is accurate
+ #ifndef _WIN32
+@@ -1397,7 +1402,11 @@
+                     }
+                     // try the conversion again with the complete character
+ #ifndef _WIN32
++                    #ifdef HAVE_iODBC
++					wsize = SystemLocale::ToUtf16Strict( stmt->current_stream.encoding, buffer, static_cast<int>(read + new_read), wbuffer, static_cast<int>(sizeof( wbuffer ) / sizeof( WCHAR )));
++					#else
+                     wsize = SystemLocale::ToUtf16Strict( stmt->current_stream.encoding, buffer, static_cast<int>(read + new_read), wbuffer, static_cast<int>(sizeof( wbuffer ) / sizeof( SQLWCHAR )));
++					#endif
+ #else
+                     wsize = MultiByteToWideChar( stmt->current_stream.encoding, MB_ERR_INVALID_CHARS, buffer, static_cast<int>( read + new_read ), wbuffer, static_cast<int>( sizeof( wbuffer ) / sizeof( wchar_t )));
+ #endif //!_WIN32
+@@ -1406,7 +1415,11 @@
+                         throw core::CoreException();
+                     }
+                 }
++                #ifdef HAVE_iODBC
++				core::SQLPutData( stmt, wbuffer, wsize * sizeof( WCHAR ) TSRMLS_CC );
++				#else
+                 core::SQLPutData( stmt, wbuffer, wsize * sizeof( SQLWCHAR ) TSRMLS_CC );
++				#endif
+             }
+             else {
+                 core::SQLPutData( stmt, buffer, read TSRMLS_CC );
+@@ -1900,8 +1913,13 @@
+     if( wchar_size == 0 ) {
+         return false;
+     }
++	#ifdef HAVE_iODBC
++	sqlsrv_malloc_auto_ptr<WCHAR> wbuffer;
++    wbuffer = reinterpret_cast<WCHAR*>( sqlsrv_malloc( (wchar_size + 1) * sizeof( WCHAR ) ));
++	#else
+     sqlsrv_malloc_auto_ptr<SQLWCHAR> wbuffer;
+     wbuffer = reinterpret_cast<SQLWCHAR*>( sqlsrv_malloc( (wchar_size + 1) * sizeof( SQLWCHAR ) ));
++	#endif
+     // convert the utf-8 string to a wchar string in the new buffer
+ #ifndef _WIN32
+     int rc = SystemLocale::ToUtf16Strict( CP_UTF8, reinterpret_cast<LPCSTR>( buffer ), static_cast<int>( buffer_len ), wbuffer, wchar_size );
+@@ -1916,7 +1934,11 @@
+ 
+     // null terminate the string, set the size within the zval, and return success
+     wbuffer[ wchar_size ] = L'\0';
++	#ifdef HAVE_iODBC
++	core::sqlsrv_zval_stringl( converted_param_z, reinterpret_cast<char*>( wbuffer.get() ), wchar_size * sizeof( WCHAR ) );
++	#else
+     core::sqlsrv_zval_stringl( converted_param_z, reinterpret_cast<char*>( wbuffer.get() ), wchar_size * sizeof( SQLWCHAR ) );
++	#endif
+     sqlsrv_free(wbuffer);
+     wbuffer.transferred();
+ 
+@@ -2094,7 +2116,11 @@
+             break;
+         case IS_STRING:
+         {
++            #ifdef HAVE_iODBC
++			size_t char_size = (encoding == SQLSRV_ENCODING_UTF8 ) ? sizeof( WCHAR ) : sizeof( char );
++			#else
+             size_t char_size = (encoding == SQLSRV_ENCODING_UTF8 ) ? sizeof( SQLWCHAR ) : sizeof( char );
++			#endif
+             SQLULEN byte_len = Z_STRLEN_P(param_z) * char_size;
+             if( byte_len > SQL_SERVER_MAX_FIELD_SIZE ) {
+                 column_size = SQL_SERVER_MAX_TYPE_SIZE;
+@@ -2319,7 +2345,11 @@
+             int null_size = 0;
+             switch( output_param->encoding ) {
+             case SQLSRV_ENCODING_UTF8:
++				#ifdef HAVE_iODBC
++				null_size = sizeof( WCHAR );  // string isn't yet converted to UTF-8, still UTF-16
++				#else
+                 null_size = sizeof( SQLWCHAR );  // string isn't yet converted to UTF-8, still UTF-16
++				#endif
+                 break;
+             case SQLSRV_ENCODING_SYSTEM:
+                 null_size = 1;
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/shared/core_stream.cpp	2019-03-19 22:33:46.000000000 +0100
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/shared/core_stream.cpp	2019-05-06 11:21:41.816070000 +0200
+@@ -166,8 +166,13 @@
+            }
+ 
+ #ifndef _WIN32
++            #ifdef HAVE_iODBC
++			int enc_len = SystemLocale::FromUtf16( ss->encoding, reinterpret_cast<WCHAR*>( temp_buf.get() ),
++                                                   static_cast<int>(read >> 1), buf, static_cast<int>(count), NULL, NULL );
++            #else
+             int enc_len = SystemLocale::FromUtf16( ss->encoding, reinterpret_cast<LPCWSTR>( temp_buf.get() ),
+                                                    static_cast<int>(read >> 1), buf, static_cast<int>(count), NULL, NULL );
++            #endif
+ #else
+             int enc_len = WideCharToMultiByte( ss->encoding, flags, reinterpret_cast<LPCWSTR>( temp_buf.get() ),
+                                                static_cast<int>(read >> 1), buf, static_cast<int>(count), NULL, NULL );
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/shared/core_util.cpp	2019-03-19 22:33:46.000000000 +0100
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/shared/core_util.cpp	2019-05-06 11:21:41.816070000 +0200
+@@ -99,7 +99,11 @@
+      if( len == 0 && string[0] == '\0') {
+          return true;
+      }
++    #ifdef HAVE_iODBC
++	if ((len / sizeof(WCHAR)) > INT_MAX) {
++	#else
+     if ((len / sizeof(SQLWCHAR)) > INT_MAX) {
++	#endif
+         LOG(SEV_ERROR, "UTP-16 (wide character) string mapping: buffer length exceeded.");
+         throw core::CoreException();
+     }
+@@ -148,7 +152,11 @@
+     memset(newString, '\0', cchOutLen+1);
+     
+ #ifndef _WIN32
+-    int rc = SystemLocale::FromUtf16Strict( encoding, inString, cchInLen, newString, static_cast<int>(cchOutLen));
++	#ifdef HAVE_iODBC
++    int rc = SystemLocale::FromUtf16Strict( encoding, (WCHAR*) inString, cchInLen, newString, static_cast<int>(cchOutLen));
++	#else
++	int rc = SystemLocale::FromUtf16Strict( encoding, inString, cchInLen, newString, static_cast<int>(cchOutLen));
++	#endif
+ #else
+     int rc = WideCharToMultiByte( encoding, flags, inString, cchInLen, newString, static_cast<int>(cchOutLen), NULL, NULL );
+ #endif // !_WIN32
+@@ -400,7 +408,11 @@
+             break;
+     }
+ #ifndef _WIN32 
++	#ifdef HAVE_iODBC
++    unsigned int required_len = SystemLocale::ToUtf16( win_encoding, mbcs_in_string, mbcs_len, (WCHAR*) utf16_out_string, utf16_len );
++	#else
+     unsigned int required_len = SystemLocale::ToUtf16( win_encoding, mbcs_in_string, mbcs_len, utf16_out_string, utf16_len );
++	#endif
+ #else
+     unsigned int required_len = MultiByteToWideChar( win_encoding, MB_ERR_INVALID_CHARS, mbcs_in_string, mbcs_len, utf16_out_string, utf16_len );
+ #endif // !_Win32
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/shared/xplat.h	2019-05-06 11:20:43.854917300 +0200
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/shared/xplat.h	2019-05-06 11:21:41.816070000 +0200
+@@ -132,8 +132,14 @@
+ #else
+ typedef unsigned short 		WCHAR;
+ #endif
++#ifdef HAVE_iODBC
++typedef wchar_t *LPWSTR;
++typedef CONST wchar_t *LPCWSTR;
++typedef CHAR *LPTSTR;
++#else
+ typedef WCHAR *LPWSTR;
+ typedef CONST WCHAR *LPCWSTR;
++#endif
+ typedef CONST CHAR *LPCSTR;
+ typedef void *PVOID;
+ typedef PVOID HANDLE;
+--- sqlsrv-5.6.1-1.x86_64/origsrc/sqlsrv-5.6.1/config.m4	2019-05-06 11:20:43.870543300 +0200
++++ sqlsrv-5.6.1-1.x86_64/src/sqlsrv-5.6.1/config.m4	2019-05-06 11:21:41.831696000 +0200
+@@ -18,6 +18,38 @@
+ dnl   IN THE SOFTWARE.
+ dnl ---------------------------------------------------------------------------------------------------------------------------------
+ 
++PHP_ARG_WITH(odbc, for ODBC support,
++[  --with-odbc[=auto|unixODBC|iODBC]       Which ODBC library should be used. Default is auto.], auto, auto)
++
++if test "$PHP_ODBC" != "auto" && test "$PHP_ODBC" != "unixODBC" && test "$PHP_ODBC" != "iODBC"; then
++	AC_MSG_ERROR([Unknown option for --with-odbc])
++fi
++
++dnl Checking for ODBC Library
++AC_MSG_CHECKING([for ODBC Library])
++if test "$PHP_ODBC" == "auto"; then
++	AC_SEARCH_LIBS(
++		[SQLGetInstalledDrivers], 
++		[odbcinst iodbcinst], 
++		[AS_IF([test x$ac_cv_search_SQLGetInstalledDrivers != "xnone required"],[ODBC_LIB=$ac_cv_search_SQLGetInstalledDrivers], [ODBC_LIB=]) AC_SUBST([ODBC_LIB])],
++		[AC_MSG_ERROR([Unable to find the SQLGetInstalledDrivers() function in -lodbcinst or -liodbcinst])]
++	)
++elif test "$PHP_ODBC" == "unixODBC"; then
++	AC_SEARCH_LIBS(
++		[SQLGetInstalledDrivers], 
++		[odbcinst], 
++		[AS_IF([test x$ac_cv_search_SQLGetInstalledDrivers != "xnone required"],[ODBC_LIB=$ac_cv_search_SQLGetInstalledDrivers], [ODBC_LIB=]) AC_SUBST([ODBC_LIB])],
++		[AC_MSG_ERROR([Unable to find the SQLGetInstalledDrivers() function in -lodbcinst])]
++	)
++elif test "$PHP_ODBC" == "iODBC"; then
++	AC_SEARCH_LIBS(
++		[SQLGetInstalledDrivers], 
++		[odbcinst], 
++		[AS_IF([test x$ac_cv_search_SQLGetInstalledDrivers != "xnone required"],[ODBC_LIB=$ac_cv_search_SQLGetInstalledDrivers], [ODBC_LIB=]) AC_SUBST([ODBC_LIB])],
++		[AC_MSG_ERROR([Unable to find the SQLGetInstalledDrivers() function in -liodbcinst])]
++	)
++fi
++
+ PHP_ARG_ENABLE(sqlsrv, whether to enable sqlsrv functions,
+ [  --disable-sqlsrv         Disable sqlsrv functions], yes)
+ 
+@@ -55,6 +87,10 @@
+   CXXFLAGS="$CXXFLAGS -std=c++11"
+   CXXFLAGS="$CXXFLAGS -D_FORTIFY_SOURCE=2 -O2"
+   CXXFLAGS="$CXXFLAGS -fstack-protector"
++  
++  if test "$ODBC_LIB" == "-liodbcinst"; then
++	CXXFLAGS="$CXXFLAGS -DHAVE_iODBC"
++  fi
+ 
+   HOST_OS_ARCH=`uname`
+   if test "${HOST_OS_ARCH}" = "Darwin"; then
+@@ -73,7 +109,12 @@
+   PHP_REQUIRE_CXX()
+   PHP_ADD_LIBRARY(stdc++, 1, SQLSRV_SHARED_LIBADD)
+   PHP_ADD_LIBRARY(odbc, 1, SQLSRV_SHARED_LIBADD)
+-  PHP_ADD_LIBRARY(odbcinst, 1, SQLSRV_SHARED_LIBADD)
++  if test "$ODBC_LIB" == "-lodbcinst"; then
++	PHP_ADD_LIBRARY(odbcinst, 1, SQLSRV_SHARED_LIBADD)
++  elif test "$ODBC_LIB" == "-liodbcinst"; then
++	PHP_ADD_LIBRARY(iodbcinst, 1, SQLSRV_SHARED_LIBADD)
++	PHP_ADD_LIBRARY(iconv, 1, SQLSRV_SHARED_LIBADD)
++  fi
+   PHP_SUBST(SQLSRV_SHARED_LIBADD)
+   AC_DEFINE(HAVE_SQLSRV, 1, [ ])
+   PHP_ADD_INCLUDE([$sqlsrv_inc_path])
